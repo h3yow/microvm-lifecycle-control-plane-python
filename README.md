@@ -39,7 +39,30 @@
 | `start` | `stopped`、`failed` |
 | `stop` | `running` |
 | `restart` | `running` |
+| `resize` | `stopped`（**原地调整规格，不重建实例**） |
 | `delete` | `stopped`、`running`、`failed` |
+
+### 实例规格调整（resize）
+
+在**不重建实例**的前提下调整 CPU 核数与内存：
+
+- **身份与归属不变**：`instance_id`、`tenant_id`、`created_at` 均保持原值，
+  调整后仍是同一个实例；实例状态全程保持 `stopped`（仅允许对**已创建但
+  未运行**的实例调整；对 `running` 实例调整返回 `409 invalid_state_transition`，
+  先 `stop` 再调即可）。
+- **原子账本变更**：在资源账本的同一把锁内完成"旧占用释放 → 容量检查 →
+  新占用计入"。调大后超出主机剩余容量时**整体拒绝**（`507 capacity_exhausted`，
+  与其他失败原因可区分），不会只调一半；拒绝后实例的状态、规格与配额占用
+  与提交前**完全一致**，仍可继续调整或删除。
+- **容量视图准确**：调整成功后 `GET /v1/admin/capacity` 立即按新规格反映
+  已用/剩余容量；调小释放出的容量立即可被其他实例使用。
+- **与其他操作同队列**：resize 与 start/stop/restart/delete 使用同一把
+  "每实例锁"。同一实例上已有操作进行中时，resize（或其反向碰撞）立即得到
+  `409 operation_conflict`，两个操作不会互相覆盖。
+- **幂等**：支持 `X-Idempotency-Key`。同键同体重放返回首次结果，不重复
+  扣减/归还容量；同键不同体返回 `409 idempotency_conflict`。首次容量不足
+  的失败也会被记录，同键重放得到相同失败；待其他实例释放容量后，用**新的
+  请求**（不带旧键或用新键）重试即可成功。
 
 ### 失败回滚（不残留半成品）
 
@@ -108,6 +131,7 @@
 | POST | `/v1/instances/{id}/start` | 启动 |
 | POST | `/v1/instances/{id}/stop` | 停止 |
 | POST | `/v1/instances/{id}/restart` | 重启 |
+| POST | `/v1/instances/{id}/resize` | 原地调整规格（请求体 `{"cpus":N,"memory_mb":N}`，可带幂等键） |
 | POST | `/v1/instances/{id}/delete` | 删除 |
 | GET | `/v1/instances/{id}` | 查询单个实例 |
 | GET | `/v1/instances` | 列举本租户实例 |
@@ -151,6 +175,7 @@ uv run python -m pytest tests/test_idempotency.py -s   # 幂等重放 / 不重�
 uv run python -m pytest tests/test_capacity.py -s      # 容量耗尽 / 失败回滚无残留
 uv run python -m pytest tests/test_authz.py -s         # 越权访问 / 管理操作
 uv run python -m pytest tests/test_state_machine.py -s # 非法状态迁移
+uv run python -m pytest tests/test_resize.py -s        # 规格调整：成功/容量拒绝/并发冲突/幂等/恢复
 uv run python -m pytest tests/test_api.py -s           # HTTP 端到端
 ```
 
@@ -172,6 +197,13 @@ curl -s -X POST localhost:8000/v1/instances \
 curl -s -X POST localhost:8000/v1/instances/$ID/start  -H 'Authorization: Bearer token-tenant-a'
 curl -s -X POST localhost:8000/v1/instances/$ID/restart -H 'Authorization: Bearer token-tenant-a'
 curl -s -X POST localhost:8000/v1/instances/$ID/stop   -H 'Authorization: Bearer token-tenant-a'
+
+# 原地调整规格（仅 stopped 实例；同键重放不重复计账）
+curl -s -X POST localhost:8000/v1/instances/$ID/resize \
+  -H 'Authorization: Bearer token-tenant-a' \
+  -H 'X-Idempotency-Key: resize-1' -H 'Content-Type: application/json' \
+  -d '{"cpus":2,"memory_mb":512}'
+
 curl -s -X POST localhost:8000/v1/instances/$ID/delete -H 'Authorization: Bearer token-tenant-a'
 
 # 容量视图（仅管理员）
@@ -184,10 +216,27 @@ curl -s localhost:8000/v1/admin/capacity -H 'Authorization: Bearer token-admin'
 | --- | --- |
 | `microvm/states.py` | 状态枚举、合法迁移表、操作允许的源状态 |
 | `microvm/errors.py` | 带稳定 code 与 HTTP 状态的错误类型 |
-| `microvm/resources.py` | 全局容量账本，原子检查+扣减，拒绝超卖 |
+| `microvm/resources.py` | 全局容量账本，原子检查+扣减（`try_resize` 支持原子调规格），拒绝超卖 |
 | `microvm/store.py` | 实例注册表 + 每实例锁（冲突串行化） |
 | `microvm/idempotency.py` | 幂等键记录 + 每键锁（重放首次结果） |
 | `microvm/hypervisor.py` | 本地子进程模拟 VM 运行/回收 + 故障注入 |
 | `microvm/auth.py` | Bearer 鉴权、租户隔离、管理员判定 |
-| `microvm/service.py` | 生命周期编排：状态机+配额+回滚的唯一事务边界 |
+| `microvm/service.py` | 生命周期编排：状态机+配额+回滚的唯一事务边界（含 `resize`） |
 | `microvm/api.py` | FastAPI 路由、错误码到 HTTP 的映射、请求日志 |
+
+---
+
+## 6. 兼容性说明
+
+本次仅**新增**能力，原有接口与状态语义保持不变：
+
+- 原有 `create/start/stop/restart/delete` 的路径、请求/响应结构、错误码
+  与状态机语义**完全不变**；resize 是新增的 `POST /v1/instances/{id}/resize`，
+  不占用也不改变既有动作名。
+- 实例的五个状态（`pending/stopped/running/failed/deleted`）含义不变；
+  resize 不引入新状态，调整期间实例稳定停留在 `stopped`。
+- resize 复用既有的每实例锁、幂等存储、错误码体系与统一错误响应结构，
+  对未携带幂等键的调用方无任何额外要求。
+- 失败后的可恢复承诺对所有操作一致：任何操作失败，实例都停在一个可解释、
+  可继续处理的稳定态（`stopped/running/failed` 或记录已移除），可重试或
+  删除；容量账本始终与真正持配额的实例一一对应。
