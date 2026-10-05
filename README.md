@@ -6,7 +6,13 @@
 - Web 框架：FastAPI（内存态，无外部依赖）
 - VM 模拟：每个运行态实例对应一个真实的长睡眠子进程（独立进程组），
   停止/删除时 `SIGKILL` 进程组并 `wait()` 回收，无僵尸进程
-- 测试：pytest（并发、幂等重放、容量耗尽与回滚、越权访问）
+- 测试：pytest（并发、幂等重放、容量耗尽与回滚、越权访问、规格调整）
+
+> **规格调整（resize）**：支持在**不重建实例**的前提下，对处于 `stopped`
+> 的实例就地调整 `cpus` / `memory_mb`。实例 id 与租户归属不变，配额按新
+> 规格原子重算，容量不足时整体拒绝且无残留。与原有接口和状态语义完全
+> 兼容：原有接口路径、请求/响应结构、状态枚举与错误码均保持不变，resize
+> 仅为新增操作（`POST /v1/instances/{id}/resize`）。
 
 ---
 
@@ -39,6 +45,7 @@
 | `start` | `stopped`、`failed` |
 | `stop` | `running` |
 | `restart` | `running` |
+| `resize` | `stopped`（仅关机态可就地调整规格） |
 | `delete` | `stopped`、`running`、`failed` |
 
 ### 失败回滚（不残留半成品）
@@ -48,6 +55,10 @@
 - **start**：`failed` 重试时先占配额；进程拉起失败则**归还配额、落 `failed`、
   不留进程**，可再次 `start` 或 `delete`。
 - **restart**：先回收旧进程再拉新进程；新进程失败时同样释放配额并落 `failed`。
+- **resize（调整规格）**：在每实例锁内把占用**原子地从旧规格换成新规格**
+  （按"归还旧占用、计入新占用"后的账本校验，实例自身的旧配额不会挡住自己的
+  调大申请）。容量不足时**整体拒绝、不调一半**：实例回到 `stopped`、保持
+  **原规格**，配额与提交前一模一样，可稍后重试。实例 id 与租户归属始终不变。
 - **delete**：回收进程，仅当实例此前持有配额时**恰好归还一次**，然后移除记录。
 
 ---
@@ -62,12 +73,24 @@
 - CPU 与内存是两个独立维度，任一维度不足即拒绝。
 - `stopped` 实例继续占用配额（关机不等于删除）；`failed` 不占配额。
 - 删除实例或启动失败回滚时释放配额。
+- **调整规格**按新规格重算占用：调大在"旧占用 + 主机剩余"范围内生效，
+  调小立即释放多出的容量；成功后容量视图随之变化，始终与真实占用对得上。
+
+### 失败后的可恢复性（不出现"卡死"实例）
+
+- 任何操作失败后，实例只停在稳定可处理的状态：`stopped`（如 resize 被拒）
+  或 `failed`（如 start/restart 进程失败），不会停在 `pending`，也不会出现
+  "所有操作都非法、实例却挂在列表里、容量账对不上"的情况。
+- `stopped` 上失败的 resize 之后：可再次 `resize` 重试——当其他实例被删除、
+  主机腾出足够容量后重试即成功；也可直接 `delete` 按原规格归还配额。
+- `failed` 实例可 `start`（重新占用配额）或 `delete`（不持配额，直接移除）。
 
 ### 并发与串行化
 
-- **同一实例**的操作由“每实例锁”串行化；锁以**非阻塞**方式获取，
-  抢不到立即返回 `409 operation_conflict`（与非法迁移 `invalid_state_transition`
-  是两个可区分的失败码）。
+- **同一实例**的操作（含新增的 `resize`）由“每实例锁”串行化；锁以**非阻塞**
+  方式获取，抢不到立即返回 `409 operation_conflict`（与非法迁移
+  `invalid_state_transition` 是两个可区分的失败码）。因此 resize 与
+  start/stop/restart/delete 不可能同时改同一个实例、互相覆盖。
 - **不同实例**的创建在资源账本锁上短暂串行，保证账本一致。
 - **同一幂等键**的并发提交由“每键锁”串行：首个请求执行，其余重放首次结果。
 
@@ -108,6 +131,7 @@
 | POST | `/v1/instances/{id}/start` | 启动 |
 | POST | `/v1/instances/{id}/stop` | 停止 |
 | POST | `/v1/instances/{id}/restart` | 重启 |
+| POST | `/v1/instances/{id}/resize` | 就地调整规格（请求体 `{"cpus":N,"memory_mb":N}`，仅 `stopped`） |
 | POST | `/v1/instances/{id}/delete` | 删除 |
 | GET | `/v1/instances/{id}` | 查询单个实例 |
 | GET | `/v1/instances` | 列举本租户实例 |
@@ -151,6 +175,7 @@ uv run python -m pytest tests/test_idempotency.py -s   # 幂等重放 / 不重�
 uv run python -m pytest tests/test_capacity.py -s      # 容量耗尽 / 失败回滚无残留
 uv run python -m pytest tests/test_authz.py -s         # 越权访问 / 管理操作
 uv run python -m pytest tests/test_state_machine.py -s # 非法状态迁移
+uv run python -m pytest tests/test_resize.py -s        # 规格调整：成功/容量拒绝/并发冲突/幂等/恢复
 uv run python -m pytest tests/test_api.py -s           # HTTP 端到端
 ```
 
@@ -172,6 +197,13 @@ curl -s -X POST localhost:8000/v1/instances \
 curl -s -X POST localhost:8000/v1/instances/$ID/start  -H 'Authorization: Bearer token-tenant-a'
 curl -s -X POST localhost:8000/v1/instances/$ID/restart -H 'Authorization: Bearer token-tenant-a'
 curl -s -X POST localhost:8000/v1/instances/$ID/stop   -H 'Authorization: Bearer token-tenant-a'
+
+# 就地调整规格（仅 stopped；带同一个幂等键重放返回首次结果）
+curl -s -X POST localhost:8000/v1/instances/$ID/resize \
+  -H 'Authorization: Bearer token-tenant-a' \
+  -H 'X-Idempotency-Key: resize-demo-1' -H 'Content-Type: application/json' \
+  -d '{"cpus":2,"memory_mb":512}'
+
 curl -s -X POST localhost:8000/v1/instances/$ID/delete -H 'Authorization: Bearer token-tenant-a'
 
 # 容量视图（仅管理员）
@@ -184,7 +216,7 @@ curl -s localhost:8000/v1/admin/capacity -H 'Authorization: Bearer token-admin'
 | --- | --- |
 | `microvm/states.py` | 状态枚举、合法迁移表、操作允许的源状态 |
 | `microvm/errors.py` | 带稳定 code 与 HTTP 状态的错误类型 |
-| `microvm/resources.py` | 全局容量账本，原子检查+扣减，拒绝超卖 |
+| `microvm/resources.py` | 全局容量账本，原子检查+扣减，拒绝超卖，resize 原子换账 |
 | `microvm/store.py` | 实例注册表 + 每实例锁（冲突串行化） |
 | `microvm/idempotency.py` | 幂等键记录 + 每键锁（重放首次结果） |
 | `microvm/hypervisor.py` | 本地子进程模拟 VM 运行/回收 + 故障注入 |

@@ -59,6 +59,46 @@ def test_idempotency_header_over_http(c):
     assert len(listing) == 1
 
 
+def test_resize_over_http(c):
+    # 创建一台 (1,128)
+    r = c.post("/v1/instances", headers=H_A, json={"name": "scale-me", "cpus": 1, "memory_mb": 128})
+    assert r.status_code == 201
+    iid = r.json()["instance_id"]
+    print(f"\n[HTTP-resize] 输入: POST /v1/instances/{iid}/resize (2,256) 带幂等键")
+
+    h = {**H_A, "X-Idempotency-Key": "http-resize-1"}
+    r1 = c.post(f"/v1/instances/{iid}/resize", headers=h, json={"cpus": 2, "memory_mb": 256})
+    r2 = c.post(f"/v1/instances/{iid}/resize", headers=h, json={"cpus": 2, "memory_mb": 256})
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["cpus"] == 2 and r1.json()["memory_mb"] == 256
+    print(f"[HTTP-resize] 判定: 两次重放同规格、同实例 id="
+          f"{r1.json()['instance_id'] == r2.json()['instance_id']}，state={r1.json()['state']}")
+    assert r1.json()["instance_id"] == r2.json()["instance_id"]
+
+    # 占满其余容量（已用 2C/256MB，再建 2C/700MB -> 已用 4C/956MB，无法把第一台调到 3C）
+    rf = c.post("/v1/instances", headers=H_A, json={"name": "filler", "cpus": 2, "memory_mb": 700})
+    assert rf.status_code == 201
+    r = c.post(f"/v1/instances/{iid}/resize", headers=H_A, json={"cpus": 3, "memory_mb": 256})
+    print(f"[HTTP-resize] 判定: 容量不足 http={r.status_code} code={r.json()['error']['code']}")
+    assert r.status_code == 507
+    assert r.json()["error"]["code"] == "capacity_exhausted"
+
+    # 非法请求体（cpus<=0）
+    r = c.post(f"/v1/instances/{iid}/resize", headers=H_A, json={"cpus": 0, "memory_mb": 128})
+    print(f"[HTTP-resize] 判定: 非法体 http={r.status_code}（FastAPI 校验）")
+    assert r.status_code == 422
+
+    # RUNNING 时 resize 被拒
+    c.post(f"/v1/instances/{iid}/start", headers=H_A)
+    r = c.post(f"/v1/instances/{iid}/resize", headers=H_A, json={"cpus": 1, "memory_mb": 128})
+    print(f"[HTTP-resize] 判定: RUNNING resize http={r.status_code} "
+          f"code={r.json()['error']['code']}")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_state_transition"
+    c.post(f"/v1/instances/{iid}/stop", headers=H_A)
+    c.post(f"/v1/instances/{iid}/delete", headers=H_A)
+
+
 def test_capacity_and_authz_over_http(c):
     print("\n[HTTP] 输入: 占满 4C 后再申请 1C")
     r = c.post("/v1/instances", headers=H_A, json={"name": "big", "cpus": 4, "memory_mb": 1000})

@@ -26,6 +26,11 @@ class CreateRequest(BaseModel):
     fault_inject: bool = False
 
 
+class ResizeRequest(BaseModel):
+    cpus: int = Field(gt=0)
+    memory_mb: int = Field(gt=0)
+
+
 def build_default_service() -> LifecycleService:
     # 本地默认：4 vCPU / 1024MB 小容量主机，便于快速验证容量耗尽
     return LifecycleService(
@@ -86,6 +91,21 @@ def create_app(service: LifecycleService | None = None) -> FastAPI:
             fault_inject=body.fault_inject,
         )
         inst = service.create_instance(principal, spec, x_idempotency_key)
+        return _instance_dict(inst)
+
+    @app.post("/v1/instances/{instance_id}/resize")
+    def resize_instance(
+        instance_id: str,
+        body: ResizeRequest,
+        authorization: str | None = Header(default=None),
+        x_idempotency_key: str | None = Header(default=None),
+    ):
+        log.info("HTTP POST /v1/instances/%s/resize 输入=%s idem=%s",
+                 instance_id, body.model_dump(), x_idempotency_key)
+        principal = _principal(authorization)
+        inst = service.resize(
+            principal, instance_id, body.cpus, body.memory_mb, x_idempotency_key
+        )
         return _instance_dict(inst)
 
     @app.post("/v1/instances/{instance_id}/{action}")

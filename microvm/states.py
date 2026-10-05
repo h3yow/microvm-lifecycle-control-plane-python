@@ -2,7 +2,7 @@
 
 状态说明
 --------
-PENDING  : 操作进行中的瞬时态（创建提交 / 启动 / 停止 / 重启 / 删除），
+PENDING  : 操作进行中的瞬时态（创建提交 / 启动 / 停止 / 重启 / 调整规格 / 删除），
            持锁期间可见，正常情况下不会被外部请求稳定观测到。
 STOPPED  : 已创建或已关机；实例仍持有主机配额，但没有存活进程。
 RUNNING  : 本地模拟进程存活，实例持有配额。
@@ -53,6 +53,7 @@ OPERATION_SOURCES: dict[str, set[InstanceState]] = {
     "start": {InstanceState.STOPPED, InstanceState.FAILED},
     "stop": {InstanceState.RUNNING},
     "restart": {InstanceState.RUNNING},
+    "resize": {InstanceState.STOPPED},
     "delete": {InstanceState.STOPPED, InstanceState.FAILED, InstanceState.RUNNING},
 }
 

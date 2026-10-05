@@ -164,6 +164,36 @@ class LifecycleService:
 
         return self._idem_call(idempotency_key, req_hash, do)  # type: ignore[return-value]
 
+    def resize(
+        self,
+        principal: Principal,
+        instance_id: str,
+        cpus: int,
+        memory_mb: int,
+        idempotency_key: str | None,
+    ) -> Instance:
+        """就地调整已关机实例的规格；实例 id 与归属不变，配额按新规格重算。"""
+        if not isinstance(cpus, int) or cpus <= 0:
+            raise InvalidRequest("cpus 必须为正整数")
+        if not isinstance(memory_mb, int) or memory_mb <= 0:
+            raise InvalidRequest("memory_mb 必须为正整数")
+        req_hash = self._hash(
+            "resize",
+            principal.tenant_id,
+            {"instance_id": instance_id, "cpus": cpus, "memory_mb": memory_mb},
+        )
+        log.info(
+            "请求 resize tenant=%s id=%s 新规格 cpus=%s mem=%sMB idem=%s",
+            principal.tenant_id, instance_id, cpus, memory_mb, idempotency_key,
+        )
+
+        def do() -> Instance:
+            return self._lifecycle(
+                principal, instance_id, "resize", new_cpus=cpus, new_memory_mb=memory_mb
+            )
+
+        return self._idem_call(idempotency_key, req_hash, do)  # type: ignore[return-value]
+
     def delete(
         self, principal: Principal, instance_id: str, idempotency_key: str | None
     ) -> dict[str, Any]:
@@ -205,7 +235,12 @@ class LifecycleService:
     # 内部：统一的状态迁移事务
     # ------------------------------------------------------------------ #
     def _lifecycle(
-        self, principal: Principal, instance_id: str, operation: str
+        self,
+        principal: Principal,
+        instance_id: str,
+        operation: str,
+        new_cpus: int | None = None,
+        new_memory_mb: int | None = None,
     ) -> Instance:
         instance = self._store.get(instance_id)
         if instance is None:
@@ -273,6 +308,40 @@ class LifecycleService:
                 instance.pid = pid
                 instance.state = InstanceState.RUNNING
                 instance.status_message = "已重启运行"
+
+            elif operation == "resize":
+                # 仅 STOPPED 可进入（由 can_perform 保证）：无存活进程、正持有旧规格配额
+                old_spec = instance.spec
+                new_spec = InstanceSpec(
+                    name=old_spec.name,
+                    cpus=new_cpus,  # type: ignore[arg-type]
+                    memory_mb=new_memory_mb,  # type: ignore[arg-type]
+                    fault_inject=old_spec.fault_inject,
+                )
+                log.info(
+                    "判定 resize 进行中 id=%s：旧规格 cpus=%s mem=%sMB -> 新规格 cpus=%s mem=%sMB",
+                    instance_id, old_spec.cpus, old_spec.memory_mb,
+                    new_spec.cpus, new_spec.memory_mb,
+                )
+                try:
+                    # 原子"旧占用换出新占用"：容量不足直接抛错，账本不动
+                    self._resources.try_resize(old_spec, new_spec)
+                except BaseException:
+                    # 整体拒绝：状态回到 STOPPED，spec 保持旧值，配额与提交前一致
+                    instance.state = InstanceState.STOPPED
+                    instance.status_message = "调整规格被拒绝：保持原规格，可稍后重试"
+                    log.warning(
+                        "判定 resize 拒绝 id=%s：容量不足，实例仍为 STOPPED 且占用旧规格",
+                        instance_id,
+                    )
+                    raise
+                instance.spec = new_spec
+                instance.state = InstanceState.STOPPED
+                instance.status_message = "规格已调整，处于关机态"
+                log.info(
+                    "判定 resize 成功 id=%s：现规格 cpus=%s mem=%sMB，身份与归属不变",
+                    instance_id, new_spec.cpus, new_spec.memory_mb,
+                )
 
             elif operation == "delete":
                 if instance.pid is not None:
